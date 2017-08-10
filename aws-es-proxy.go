@@ -16,18 +16,38 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/aws/signer/v4"
 )
 
 type proxy struct {
-	Scheme   string
-	Host     string
-	Region   string
-	Service  string
-	Verbose  bool
-	Prettify bool
-	Signer   *v4.Signer
+	Scheme               string
+	Host                 string
+	Region               string
+	Service              string
+	Verbose              bool
+	Prettify             bool
+	Refresh              float64
+	CredentialsLastUpped time.Time
+	Credentials          *credentials.Credentials
+}
+
+func getSigner(p *proxy) *v4.Signer {
+	now := time.Now()
+	diff := now.Sub(p.CredentialsLastUpped)
+	if p.Credentials == nil || diff.Seconds() > p.Refresh {
+		p.Credentials, p.CredentialsLastUpped = getCredentials()
+	}
+
+	return v4.NewSigner(p.Credentials)
+}
+
+func getCredentials() (*credentials.Credentials, time.Time) {
+	sess := session.Must(session.NewSession())
+	Credentials := sess.Config.Credentials
+	log.Print("Generated fresh AWS Credentials object")
+	return Credentials, time.Now()
 }
 
 func copyHeaders(dst, src http.Header) {
@@ -111,9 +131,12 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("Kbn-Version", val[0])
 	}
 
+	// Start AWS session from ENV, Shared Creds or EC2Role
+	signer := getSigner(p)
+
 	// Sign the request with AWSv4
 	payload := bytes.NewReader(replaceBody(req))
-	p.Signer.Sign(req, payload, p.Service, p.Region, time.Now())
+	signer.Sign(req, payload, p.Service, p.Region, time.Now())
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -183,12 +206,14 @@ func main() {
 	var endpoint, listenAddress string
 	var verbose bool
 	var prettify bool
+	var refresh float64
 
 	// TODO: Use a more sophisticated args parser that can enforce arguments
 	flag.StringVar(&endpoint, "endpoint", "", "Amazon ElasticSearch Endpoint (e.g: https://dummy-host.eu-west-1.es.amazonaws.com)")
 	flag.StringVar(&listenAddress, "listen", "127.0.0.1:9200", "Local TCP port to listen on")
 	flag.BoolVar(&verbose, "verbose", false, "Print user requests")
 	flag.BoolVar(&prettify, "pretty", false, "Prettify verbose output")
+	flag.Float64Var(&refresh, "refresh", 120, "Refresh AWS Credentials Automatically every XX seconds")
 
 	flag.Parse()
 
@@ -198,14 +223,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Start AWS session from ENV, Shared Creds or EC2Role
-	sess, err := session.NewSession()
-	if err != nil {
-		log.Fatalln(err)
-	}
-	signer := v4.NewSigner(sess.Config.Credentials)
-
-	mux := &proxy{Verbose: verbose, Prettify: prettify, Signer: signer}
+	mux := &proxy{Verbose: verbose, Prettify: prettify, Refresh: refresh}
 	parseEndpoint(endpoint, mux)
 
 	fmt.Printf("Listening on %s\n", listenAddress)
